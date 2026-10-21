@@ -1,0 +1,1010 @@
+#!/usr/bin/env bash
+# WireGuard server and peer manager for systemd-based Linux servers.
+# Supports Debian/Ubuntu, Fedora/RHEL-family, Arch, and openSUSE package managers.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+PROGRAM=${0##*/}
+VERSION="1.1.0"
+
+BASE_DIR="/etc/wireguard/wg-manager"
+STATE_FILE="$BASE_DIR/settings.conf"
+USERS_DIR="$BASE_DIR/users"
+LOCK_DIR="/run/lock/wg-manager.lock"
+DEFAULT_INTERFACE="wg0"
+DEFAULT_PORT="51820"
+DEFAULT_SUBNET="10.66.66.0/24"
+DEFAULT_DNS="1.1.1.1, 1.0.0.1"
+DEFAULT_ACTIVE_SECONDS="180"
+
+LOCK_HELD=0
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+cleanup() {
+    if (( LOCK_HELD )); then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+require_root() {
+    (( EUID == 0 )) || die "Run this command as root (for example, with sudo)."
+}
+
+require_bash4() {
+    (( BASH_VERSINFO[0] >= 4 )) || die "Bash 4 or newer is required."
+}
+
+require_systemd() {
+    command -v systemctl >/dev/null 2>&1 || die "This script currently requires a systemd-based Linux server."
+}
+
+acquire_lock() {
+    mkdir -p /run/lock
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        die "Another $PROGRAM operation appears to be running."
+    fi
+    LOCK_HELD=1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+detect_out_interface() {
+    local target=${1:-1.1.1.1}
+    ip -4 route get "$target" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "dev" && i < NF) {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
+validate_interface() {
+    [[ $1 =~ ^[A-Za-z0-9_.+-]{1,15}$ ]] || die "Invalid WireGuard interface name: $1"
+}
+
+validate_port() {
+    [[ $1 =~ ^[0-9]+$ ]] || die "Port must be numeric."
+    (( 1 <= 10#$1 && 10#$1 <= 65535 )) || die "Port must be between 1 and 65535."
+}
+
+validate_username() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] ||
+        die "Username must be 1-32 characters and contain only letters, numbers, dot, underscore, or hyphen."
+}
+
+validate_dns() {
+    [[ -n $1 ]] || die "DNS value cannot be empty."
+    [[ $1 != *$'\n'* && $1 != *$'\r'* ]] || die "DNS value cannot contain newlines."
+    [[ $1 =~ ^[A-Za-z0-9:.,_[:space:]-]+$ ]] ||
+        die "DNS may contain only addresses or names separated by commas."
+}
+
+validate_subnet_24() {
+    local subnet=$1 ip mask a b c d octet
+    [[ $subnet == */* ]] || die "Subnet must use CIDR notation, for example 10.66.66.0/24."
+    ip=${subnet%/*}
+    mask=${subnet#*/}
+    [[ $mask == "24" ]] || die "This script currently supports a /24 tunnel subnet only."
+    IFS='.' read -r a b c d <<< "$ip"
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ $octet =~ ^[0-9]+$ ]] || die "Invalid IPv4 subnet: $subnet"
+        (( 0 <= 10#$octet && 10#$octet <= 255 )) || die "Invalid IPv4 subnet: $subnet"
+    done
+    (( 10#$d == 0 )) || die "A /24 subnet must end in .0/24."
+
+    if ! (( 10#$a == 10 || (10#$a == 172 && 10#$b >= 16 && 10#$b <= 31) || (10#$a == 192 && 10#$b == 168) )); then
+        die "Use an RFC1918 private subnet (10/8, 172.16/12, or 192.168/16)."
+    fi
+}
+
+subnet_prefix() {
+    local ip=${1%/*}
+    printf '%s\n' "${ip%.*}"
+}
+
+normalize_endpoint() {
+    local value=$1 default_port=$2 host port
+
+    if [[ $value =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+        host=${BASH_REMATCH[1]}
+        port=${BASH_REMATCH[2]}
+        validate_port "$port"
+        printf '[%s]:%s\n' "$host" "$port"
+    elif [[ $value =~ ^([^:]+):([0-9]+)$ ]]; then
+        host=${BASH_REMATCH[1]}
+        port=${BASH_REMATCH[2]}
+        validate_port "$port"
+        printf '%s:%s\n' "$host" "$port"
+    elif [[ $value == *:* ]]; then
+        printf '[%s]:%s\n' "$value" "$default_port"
+    else
+        printf '%s:%s\n' "$value" "$default_port"
+    fi
+}
+
+install_packages() {
+    info "Installing WireGuard and required utilities..."
+
+    if command_exists apt-get; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y wireguard wireguard-tools qrencode iproute2 iptables
+    elif command_exists dnf; then
+        dnf install -y wireguard-tools qrencode iproute iptables
+    elif command_exists yum; then
+        yum install -y epel-release || true
+        yum install -y wireguard-tools qrencode iproute iptables
+    elif command_exists pacman; then
+        pacman -Sy --noconfirm --needed wireguard-tools qrencode iproute2 iptables
+    elif command_exists zypper; then
+        zypper --non-interactive install wireguard-tools qrencode iproute2 iptables
+    else
+        die "Unsupported package manager. Install wireguard-tools, qrencode, iproute2, and iptables manually."
+    fi
+
+    command_exists wg || die "The wg command is unavailable after package installation."
+    command_exists wg-quick || die "The wg-quick command is unavailable after package installation."
+    command_exists qrencode || die "The qrencode command is unavailable after package installation."
+    command_exists iptables || die "The iptables command is unavailable after package installation."
+}
+
+load_state() {
+    [[ -r $STATE_FILE ]] || die "WireGuard is not initialized by this manager. Run: sudo $PROGRAM install --endpoint <public-host-or-ip>"
+    # The file is root-owned, mode 600, and written only by this script.
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+
+    : "${WG_INTERFACE:?Missing WG_INTERFACE in settings}"
+    : "${WG_PORT:?Missing WG_PORT in settings}"
+    : "${WG_ENDPOINT:?Missing WG_ENDPOINT in settings}"
+    : "${WG_SUBNET:?Missing WG_SUBNET in settings}"
+    : "${WG_PREFIX:?Missing WG_PREFIX in settings}"
+    : "${WG_SERVER_ADDRESS:?Missing WG_SERVER_ADDRESS in settings}"
+    : "${WG_DNS:?Missing WG_DNS in settings}"
+    : "${WG_OUT_INTERFACE:?Missing WG_OUT_INTERFACE in settings}"
+
+    SERVER_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
+}
+
+write_state() {
+    local tmp
+    tmp=$(mktemp "$BASE_DIR/.settings.XXXXXX")
+    {
+        printf 'WG_INTERFACE=%q\n' "$WG_INTERFACE"
+        printf 'WG_PORT=%q\n' "$WG_PORT"
+        printf 'WG_ENDPOINT=%q\n' "$WG_ENDPOINT"
+        printf 'WG_SUBNET=%q\n' "$WG_SUBNET"
+        printf 'WG_PREFIX=%q\n' "$WG_PREFIX"
+        printf 'WG_SERVER_ADDRESS=%q\n' "$WG_SERVER_ADDRESS"
+        printf 'WG_DNS=%q\n' "$WG_DNS"
+        printf 'WG_OUT_INTERFACE=%q\n' "$WG_OUT_INTERFACE"
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+interface_is_up() {
+    wg show "$WG_INTERFACE" >/dev/null 2>&1
+}
+
+open_host_firewall() {
+    if command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw allow "${WG_PORT}/udp"
+        info "Opened UDP port $WG_PORT in UFW."
+    elif command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${WG_PORT}/udp"
+        firewall-cmd --reload
+        info "Opened UDP port $WG_PORT in firewalld."
+    else
+        info "No active UFW/firewalld installation detected. Ensure UDP port $WG_PORT is allowed by the host and cloud firewall."
+    fi
+}
+
+cmd_install() {
+    require_root
+    require_systemd
+    acquire_lock
+
+    local endpoint="" port=$DEFAULT_PORT subnet=$DEFAULT_SUBNET dns=$DEFAULT_DNS iface=$DEFAULT_INTERFACE
+
+    while (( $# )); do
+        case $1 in
+            --endpoint)
+                [[ $# -ge 2 ]] || die "--endpoint requires a value."
+                endpoint=$2
+                shift 2
+                ;;
+            --port)
+                [[ $# -ge 2 ]] || die "--port requires a value."
+                port=$2
+                shift 2
+                ;;
+            --subnet)
+                [[ $# -ge 2 ]] || die "--subnet requires a value."
+                subnet=$2
+                shift 2
+                ;;
+            --dns)
+                [[ $# -ge 2 ]] || die "--dns requires a value."
+                dns=$2
+                shift 2
+                ;;
+            --interface)
+                [[ $# -ge 2 ]] || die "--interface requires a value."
+                iface=$2
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "Unknown install option: $1"
+                ;;
+        esac
+    done
+
+    if [[ -z $endpoint ]]; then
+        if [[ -t 0 ]]; then
+            read -r -p "Public server hostname or IP: " endpoint
+        else
+            die "Provide the public server endpoint with --endpoint."
+        fi
+    fi
+
+    [[ -n $endpoint && $endpoint != *[[:space:]]* ]] || die "Endpoint must not be empty or contain whitespace."
+    validate_port "$port"
+    validate_subnet_24 "$subnet"
+    validate_dns "$dns"
+    validate_interface "$iface"
+
+    [[ ! -e $STATE_FILE ]] || die "This manager is already installed."
+    if [[ -e /etc/wireguard/${iface}.conf ]]; then
+        die "/etc/wireguard/${iface}.conf already exists; refusing to overwrite an unmanaged configuration."
+    fi
+
+    install_packages
+
+    WG_INTERFACE=$iface
+    WG_PORT=$port
+    WG_ENDPOINT=$(normalize_endpoint "$endpoint" "$port")
+    WG_SUBNET=$subnet
+    WG_PREFIX=$(subnet_prefix "$subnet")
+    WG_SERVER_ADDRESS="${WG_PREFIX}.1/24"
+    WG_DNS=$dns
+    WG_OUT_INTERFACE=$(detect_out_interface)
+    [[ -n $WG_OUT_INTERFACE ]] || die "Could not detect the default outbound network interface."
+    SERVER_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
+
+    mkdir -p "$BASE_DIR" "$USERS_DIR" /etc/wireguard
+    chmod 700 "$BASE_DIR" "$USERS_DIR" /etc/wireguard
+
+    local server_private server_public
+    server_private=$(wg genkey)
+    server_public=$(printf '%s' "$server_private" | wg pubkey)
+
+    cat > "$SERVER_CONFIG" <<CONFIG
+# Managed by $PROGRAM. Peer blocks are delimited by BEGIN_PEER/END_PEER comments.
+[Interface]
+Address = $WG_SERVER_ADDRESS
+ListenPort = $WG_PORT
+PrivateKey = $server_private
+PostUp = iptables -w -C FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || iptables -w -A FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT; iptables -w -C FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -A FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE
+PostDown = iptables -w -D FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t nat -D POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || true
+CONFIG
+    chmod 600 "$SERVER_CONFIG"
+
+    cat > /etc/sysctl.d/99-wireguard-forward.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+SYSCTL
+    chmod 644 /etc/sysctl.d/99-wireguard-forward.conf
+    sysctl -q -w net.ipv4.ip_forward=1
+
+    write_state
+    printf '%s\n' "$server_public" > "$BASE_DIR/server-public.key"
+    chmod 600 "$BASE_DIR/server-public.key"
+
+    open_host_firewall
+
+    systemctl enable --now "wg-quick@${WG_INTERFACE}.service"
+    interface_is_up || die "WireGuard service did not start successfully. Check: systemctl status wg-quick@${WG_INTERFACE}"
+
+    info ""
+    info "WireGuard installed successfully."
+    info "Interface: $WG_INTERFACE"
+    info "Server tunnel address: $WG_SERVER_ADDRESS"
+    info "Public endpoint: $WG_ENDPOINT"
+    info "Server public key: $server_public"
+    info ""
+    info "Add a user with: sudo $PROGRAM add <username>"
+}
+
+find_free_ip() {
+    local i candidate user_dir used
+    for (( i=2; i<=254; i++ )); do
+        candidate="${WG_PREFIX}.${i}"
+        used=0
+        for user_dir in "$USERS_DIR"/*; do
+            [[ -d $user_dir && -r $user_dir/ip ]] || continue
+            if [[ $(<"$user_dir/ip") == "$candidate" ]]; then
+                used=1
+                break
+            fi
+        done
+        (( used == 0 )) && {
+            printf '%s\n' "$candidate"
+            return 0
+        }
+    done
+    return 1
+}
+
+append_peer_block() {
+    local username=$1 public_key=$2 psk=$3 ip=$4
+    cat >> "$SERVER_CONFIG" <<PEER
+
+# BEGIN_PEER $username
+[Peer]
+PublicKey = $public_key
+PresharedKey = $psk
+AllowedIPs = $ip/32
+# END_PEER $username
+PEER
+    chmod 600 "$SERVER_CONFIG"
+}
+
+remove_peer_block() {
+    local username=$1 tmp
+    tmp=$(mktemp "${SERVER_CONFIG}.XXXXXX")
+    awk -v begin="# BEGIN_PEER $username" -v end="# END_PEER $username" '
+        $0 == begin { skipping=1; next }
+        $0 == end   { skipping=0; next }
+        !skipping   { print }
+    ' "$SERVER_CONFIG" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SERVER_CONFIG"
+}
+
+generate_qr_png() {
+    local username=$1 user_dir="$USERS_DIR/$1"
+    qrencode -t PNG -s 6 -m 2 -o "$user_dir/${username}.png" < "$user_dir/${username}.conf"
+    chmod 600 "$user_dir/${username}.png"
+}
+
+show_qr() {
+    local username=$1 user_dir="$USERS_DIR/$1"
+    [[ -r $user_dir/${username}.conf ]] || die "No client configuration found for user: $username"
+    printf '\nQR code for %s:\n\n' "$username"
+    qrencode -t ANSIUTF8 < "$user_dir/${username}.conf"
+    printf '\nConfiguration: %s\n' "$user_dir/${username}.conf"
+    printf 'QR image:      %s\n' "$user_dir/${username}.png"
+    printf 'Keep both files private; they contain the client private key.\n'
+}
+
+cmd_add() {
+    require_root
+    load_state
+    acquire_lock
+
+    local username=${1:-}
+    [[ -n $username ]] || die "Usage: sudo $PROGRAM add <username>"
+    validate_username "$username"
+    [[ ! -e $USERS_DIR/$username ]] || die "User already exists: $username"
+    interface_is_up || die "WireGuard interface $WG_INTERFACE is down."
+
+    local ip user_dir private_key public_key psk server_public
+    ip=$(find_free_ip) || die "No free client addresses remain in $WG_SUBNET."
+    user_dir="$USERS_DIR/$username"
+    mkdir -p "$user_dir"
+    chmod 700 "$user_dir"
+
+    private_key=$(wg genkey)
+    public_key=$(printf '%s' "$private_key" | wg pubkey)
+    psk=$(wg genpsk)
+    server_public=$(<"$BASE_DIR/server-public.key")
+
+    printf '%s\n' "$private_key" > "$user_dir/private.key"
+    printf '%s\n' "$public_key" > "$user_dir/public.key"
+    printf '%s\n' "$psk" > "$user_dir/preshared.key"
+    printf '%s\n' "$ip" > "$user_dir/ip"
+    chmod 600 "$user_dir"/*
+
+    cat > "$user_dir/${username}.conf" <<CLIENT
+[Interface]
+PrivateKey = $private_key
+Address = $ip/32
+DNS = $WG_DNS
+
+[Peer]
+PublicKey = $server_public
+PresharedKey = $psk
+Endpoint = $WG_ENDPOINT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+CLIENT
+    chmod 600 "$user_dir/${username}.conf"
+
+    wg set "$WG_INTERFACE" peer "$public_key" preshared-key "$user_dir/preshared.key" allowed-ips "$ip/32"
+    append_peer_block "$username" "$public_key" "$psk" "$ip"
+    generate_qr_png "$username"
+
+    info "Added user '$username' with address $ip."
+    show_qr "$username"
+}
+
+cmd_delete() {
+    require_root
+    load_state
+    acquire_lock
+
+    local username=${1:-}
+    [[ -n $username ]] || die "Usage: sudo $PROGRAM delete <username>"
+    validate_username "$username"
+    local user_dir="$USERS_DIR/$username"
+    [[ -d $user_dir ]] || die "Unknown user: $username"
+    [[ -r $user_dir/public.key ]] || die "Missing public key for user: $username"
+
+    local public_key
+    public_key=$(<"$user_dir/public.key")
+    if interface_is_up; then
+        wg set "$WG_INTERFACE" peer "$public_key" remove
+    fi
+    remove_peer_block "$username"
+    rm -rf -- "$user_dir"
+
+    info "Deleted user '$username'."
+}
+
+declare -A STAT_ENDPOINT=()
+declare -A STAT_HANDSHAKE=()
+declare -A STAT_RX=()
+declare -A STAT_TX=()
+
+load_runtime_stats() {
+    STAT_ENDPOINT=()
+    STAT_HANDSHAKE=()
+    STAT_RX=()
+    STAT_TX=()
+
+    local first=1 public_key psk endpoint allowed_ips handshake rx tx keepalive
+    while IFS=$'\t' read -r public_key psk endpoint allowed_ips handshake rx tx keepalive; do
+        if (( first )); then
+            first=0
+            continue
+        fi
+        [[ -n $public_key ]] || continue
+        STAT_ENDPOINT["$public_key"]=$endpoint
+        STAT_HANDSHAKE["$public_key"]=${handshake:-0}
+        STAT_RX["$public_key"]=${rx:-0}
+        STAT_TX["$public_key"]=${tx:-0}
+    done < <(wg show "$WG_INTERFACE" dump)
+}
+
+human_bytes() {
+    awk -v bytes="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB PiB", unit, " ")
+        value = bytes + 0
+        i = 1
+        while (value >= 1024 && i < 6) { value /= 1024; i++ }
+        if (i == 1) printf "%.0f %s", value, unit[i]
+        else printf "%.2f %s", value, unit[i]
+    }'
+}
+
+human_age() {
+    local epoch=${1:-0} now delta days hours mins secs
+    if (( epoch <= 0 )); then
+        printf 'never'
+        return
+    fi
+    now=$(date +%s)
+    delta=$(( now - epoch ))
+    (( delta < 0 )) && delta=0
+    days=$(( delta / 86400 ))
+    hours=$(( (delta % 86400) / 3600 ))
+    mins=$(( (delta % 3600) / 60 ))
+    secs=$(( delta % 60 ))
+    if (( days > 0 )); then
+        printf '%dd %dh ago' "$days" "$hours"
+    elif (( hours > 0 )); then
+        printf '%dh %dm ago' "$hours" "$mins"
+    elif (( mins > 0 )); then
+        printf '%dm %ds ago' "$mins" "$secs"
+    else
+        printf '%ds ago' "$secs"
+    fi
+}
+
+user_status() {
+    local handshake=${1:-0} threshold=${2:-$DEFAULT_ACTIVE_SECONDS} now
+    if (( handshake <= 0 )); then
+        printf 'never'
+        return
+    fi
+    now=$(date +%s)
+    if (( now - handshake <= threshold )); then
+        printf 'active'
+    else
+        printf 'inactive'
+    fi
+}
+
+cmd_list() {
+    require_root
+    load_state
+
+    local running=0
+    if interface_is_up; then
+        running=1
+        load_runtime_stats
+    fi
+
+    printf '%-32s %-15s %-10s %-18s\n' "USER" "ADDRESS" "STATUS" "LAST HANDSHAKE"
+    printf '%-32s %-15s %-10s %-18s\n' "--------------------------------" "---------------" "----------" "------------------"
+
+    local user_dir username ip public_key handshake status last found=0
+    for user_dir in "$USERS_DIR"/*; do
+        [[ -d $user_dir ]] || continue
+        found=1
+        username=${user_dir##*/}
+        ip=$(<"$user_dir/ip")
+        public_key=$(<"$user_dir/public.key")
+        if (( running )); then
+            handshake=${STAT_HANDSHAKE[$public_key]:-0}
+            status=$(user_status "$handshake")
+            last=$(human_age "$handshake")
+        else
+            status="down"
+            last="unavailable"
+        fi
+        printf '%-32s %-15s %-10s %-18s\n' "$username" "$ip" "$status" "$last"
+    done
+    (( found )) || info "No users have been added."
+}
+
+cmd_traffic() {
+    if [[ -n ${1:-} ]]; then
+        cmd_traffic_user "$1"
+        return
+    fi
+
+    require_root
+    load_state
+    interface_is_up || die "WireGuard interface $WG_INTERFACE is down; runtime counters are unavailable."
+    load_runtime_stats
+
+    printf '%-32s %-15s %-14s %-14s %-18s\n' "USER" "ADDRESS" "RECEIVED" "SENT" "LAST HANDSHAKE"
+    printf '%-32s %-15s %-14s %-14s %-18s\n' "--------------------------------" "---------------" "--------------" "--------------" "------------------"
+
+    local user_dir username ip public_key rx tx handshake total_rx=0 total_tx=0 found=0
+    for user_dir in "$USERS_DIR"/*; do
+        [[ -d $user_dir ]] || continue
+        found=1
+        username=${user_dir##*/}
+        ip=$(<"$user_dir/ip")
+        public_key=$(<"$user_dir/public.key")
+        rx=${STAT_RX[$public_key]:-0}
+        tx=${STAT_TX[$public_key]:-0}
+        handshake=${STAT_HANDSHAKE[$public_key]:-0}
+        total_rx=$(( total_rx + rx ))
+        total_tx=$(( total_tx + tx ))
+        printf '%-32s %-15s %-14s %-14s %-18s\n' \
+            "$username" "$ip" "$(human_bytes "$rx")" "$(human_bytes "$tx")" "$(human_age "$handshake")"
+    done
+
+    if (( found )); then
+        printf '\nTotal received from clients: %s\n' "$(human_bytes "$total_rx")"
+        printf 'Total sent to clients:      %s\n' "$(human_bytes "$total_tx")"
+        printf 'Counters reset when the WireGuard interface is recreated or the server reboots.\n'
+    else
+        info "No users have been added."
+    fi
+}
+
+cmd_traffic_user() {
+    require_root
+    load_state
+
+    local username=${1:-}
+    [[ -n $username ]] || die "Usage: sudo $PROGRAM traffic-user <username>"
+    validate_username "$username"
+    local user_dir="$USERS_DIR/$username"
+    [[ -d $user_dir ]] || die "Unknown user: $username"
+    interface_is_up || die "WireGuard interface $WG_INTERFACE is down; runtime counters are unavailable."
+    load_runtime_stats
+
+    local public_key ip rx tx handshake endpoint
+    public_key=$(<"$user_dir/public.key")
+    ip=$(<"$user_dir/ip")
+    rx=${STAT_RX[$public_key]:-0}
+    tx=${STAT_TX[$public_key]:-0}
+    handshake=${STAT_HANDSHAKE[$public_key]:-0}
+    endpoint=${STAT_ENDPOINT[$public_key]:-(none)}
+
+    printf 'User:           %s\n' "$username"
+    printf 'Tunnel address: %s\n' "$ip"
+    printf 'Received:       %s (%s bytes)\n' "$(human_bytes "$rx")" "$rx"
+    printf 'Sent:           %s (%s bytes)\n' "$(human_bytes "$tx")" "$tx"
+    printf 'Last handshake: %s\n' "$(human_age "$handshake")"
+    printf 'Latest endpoint:%s%s\n' "${endpoint:+ }" "$endpoint"
+}
+
+cmd_active() {
+    require_root
+    load_state
+
+    local threshold=${1:-$DEFAULT_ACTIVE_SECONDS}
+    [[ $threshold =~ ^[0-9]+$ ]] || die "Active threshold must be a number of seconds."
+    (( threshold > 0 )) || die "Active threshold must be greater than zero."
+    interface_is_up || die "WireGuard interface $WG_INTERFACE is down."
+    load_runtime_stats
+
+    printf 'Users with a handshake in the last %s seconds:\n\n' "$threshold"
+    printf '%-32s %-15s %-24s %-18s\n' "USER" "ADDRESS" "LATEST ENDPOINT" "LAST HANDSHAKE"
+    printf '%-32s %-15s %-24s %-18s\n' "--------------------------------" "---------------" "------------------------" "------------------"
+
+    local now user_dir username ip public_key handshake endpoint found=0
+    now=$(date +%s)
+    for user_dir in "$USERS_DIR"/*; do
+        [[ -d $user_dir ]] || continue
+        username=${user_dir##*/}
+        ip=$(<"$user_dir/ip")
+        public_key=$(<"$user_dir/public.key")
+        handshake=${STAT_HANDSHAKE[$public_key]:-0}
+        if (( handshake > 0 && now - handshake <= threshold )); then
+            found=1
+            endpoint=${STAT_ENDPOINT[$public_key]:-(unknown)}
+            printf '%-32s %-15s %-24s %-18s\n' "$username" "$ip" "$endpoint" "$(human_age "$handshake")"
+        fi
+    done
+    (( found )) || info "No active users found."
+    printf '\nWireGuard is connectionless; activity is inferred from recent handshakes.\n'
+}
+
+cmd_qr() {
+    require_root
+    load_state
+    local username=${1:-}
+    [[ -n $username ]] || die "Usage: sudo $PROGRAM qr <username>"
+    validate_username "$username"
+    [[ -d $USERS_DIR/$username ]] || die "Unknown user: $username"
+    generate_qr_png "$username"
+    show_qr "$username"
+}
+
+cmd_dns() {
+    require_root
+    load_state
+    acquire_lock
+
+    local dns=${1:-}
+    if [[ -z $dns && -t 0 ]]; then
+        read -r -p "DNS servers for all client profiles: " dns
+    fi
+    validate_dns "$dns"
+
+    WG_DNS=$dns
+    write_state
+
+    local user_dir username config tmp count=0
+    for user_dir in "$USERS_DIR"/*; do
+        [[ -d $user_dir ]] || continue
+        username=${user_dir##*/}
+        config="$user_dir/${username}.conf"
+        [[ -r $config ]] || continue
+        tmp=$(mktemp "$user_dir/.config.XXXXXX")
+        awk -v dns="$WG_DNS" '
+            BEGIN { replaced=0 }
+            /^DNS[[:space:]]*=/ { print "DNS = " dns; replaced=1; next }
+            { print }
+            END {
+                if (!replaced) {
+                    # Profiles created by this script always have DNS; this is a safety fallback.
+                }
+            }
+        ' "$config" > "$tmp"
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$config"
+        generate_qr_png "$username"
+        count=$(( count + 1 ))
+    done
+
+    info "Updated DNS to '$WG_DNS' in $count client profile(s)."
+    info "Existing devices must re-import the updated profile or change DNS locally before reconnecting."
+}
+
+check_ok() {
+    printf '[OK]   %s\n' "$*"
+}
+
+check_fail() {
+    printf '[FAIL] %s\n' "$*"
+}
+
+cmd_doctor() {
+    require_root
+    load_state
+
+    local failures=0 detected_out peer_count recent_count now handshake
+    printf 'WireGuard network diagnostics\n\n'
+
+    if interface_is_up; then
+        check_ok "Interface $WG_INTERFACE is up."
+    else
+        check_fail "Interface $WG_INTERFACE is down."
+        failures=$(( failures + 1 ))
+    fi
+
+    if [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf 0) == 1 ]]; then
+        check_ok "IPv4 forwarding is enabled."
+    else
+        check_fail "IPv4 forwarding is disabled."
+        failures=$(( failures + 1 ))
+    fi
+
+    detected_out=$(detect_out_interface || true)
+    if [[ -n $detected_out ]]; then
+        check_ok "Current internet-facing interface appears to be $detected_out."
+        if [[ $detected_out == "$WG_OUT_INTERFACE" ]]; then
+            check_ok "Saved outbound interface matches."
+        else
+            check_fail "Saved outbound interface is $WG_OUT_INTERFACE, but routing currently uses $detected_out."
+            failures=$(( failures + 1 ))
+        fi
+    else
+        check_fail "Could not detect an outbound IPv4 interface."
+        failures=$(( failures + 1 ))
+    fi
+
+    if iptables -w -t nat -C POSTROUTING -s "$WG_SUBNET" -o "$WG_OUT_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        check_ok "NAT masquerading rule is installed."
+    else
+        check_fail "NAT masquerading rule is missing."
+        failures=$(( failures + 1 ))
+    fi
+
+    if iptables -w -C FORWARD -i "$WG_INTERFACE" -o "$WG_OUT_INTERFACE" -j ACCEPT 2>/dev/null; then
+        check_ok "Client-to-internet forwarding rule is installed."
+    else
+        check_fail "Client-to-internet forwarding rule is missing."
+        failures=$(( failures + 1 ))
+    fi
+
+    if iptables -w -C FORWARD -i "$WG_OUT_INTERFACE" -o "$WG_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        check_ok "Return-traffic forwarding rule is installed."
+    else
+        check_fail "Return-traffic forwarding rule is missing."
+        failures=$(( failures + 1 ))
+    fi
+
+    if interface_is_up; then
+        now=$(date +%s)
+        peer_count=0
+        recent_count=0
+        while IFS=$'\t' read -r _ _ _ _ handshake _ _ _; do
+            peer_count=$(( peer_count + 1 ))
+            if [[ $handshake =~ ^[0-9]+$ ]] && (( handshake > 0 && now - handshake <= 180 )); then
+                recent_count=$(( recent_count + 1 ))
+            fi
+        done < <(wg show "$WG_INTERFACE" dump | tail -n +2)
+        printf '[INFO] Configured runtime peers: %s; recently handshaking: %s.\n' "$peer_count" "$recent_count"
+    fi
+
+    printf '\nClient-side isolation tests:\n'
+    printf '  1. Ping %s (tests the WireGuard tunnel itself).\n' "${WG_SERVER_ADDRESS%/*}"
+    printf '  2. Ping 1.1.1.1 (tests forwarding and NAT).\n'
+    printf '  3. Resolve example.com (tests DNS).\n'
+
+    if (( failures > 0 )); then
+        printf '\nFound %s network problem(s). Run: sudo %s repair-network\n' "$failures" "$PROGRAM"
+        return 1
+    fi
+    printf '\nNo basic server-side forwarding problem was detected.\n'
+}
+
+cmd_repair_network() {
+    require_root
+    load_state
+    acquire_lock
+
+    local old_out=$WG_OUT_INTERFACE new_out tmp
+    new_out=$(detect_out_interface) || true
+    [[ -n $new_out ]] || die "Could not detect the current outbound IPv4 interface."
+
+    # Remove rules tied to the previously saved interface before changing it.
+    iptables -w -D FORWARD -i "$WG_INTERFACE" -o "$old_out" -j ACCEPT 2>/dev/null || true
+    iptables -w -D FORWARD -i "$old_out" -o "$WG_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -w -t nat -D POSTROUTING -s "$WG_SUBNET" -o "$old_out" -j MASQUERADE 2>/dev/null || true
+
+    WG_OUT_INTERFACE=$new_out
+    write_state
+
+    tmp=$(mktemp "${SERVER_CONFIG}.XXXXXX")
+    awk -v out="$WG_OUT_INTERFACE" -v subnet="$WG_SUBNET" '
+        /^PostUp[[:space:]]*=/ {
+            print "PostUp = iptables -w -C FORWARD -i %i -o " out " -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o " out " -j ACCEPT; iptables -w -C FORWARD -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s " subnet " -o " out " -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s " subnet " -o " out " -j MASQUERADE"
+            next
+        }
+        /^PostDown[[:space:]]*=/ {
+            print "PostDown = iptables -w -D FORWARD -i %i -o " out " -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t nat -D POSTROUTING -s " subnet " -o " out " -j MASQUERADE 2>/dev/null || true"
+            next
+        }
+        { print }
+    ' "$SERVER_CONFIG" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SERVER_CONFIG"
+
+    cat > /etc/sysctl.d/99-wireguard-forward.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+SYSCTL
+    chmod 644 /etc/sysctl.d/99-wireguard-forward.conf
+    sysctl -q -w net.ipv4.ip_forward=1
+
+    systemctl restart "wg-quick@${WG_INTERFACE}.service"
+    interface_is_up || die "WireGuard did not restart successfully. Check systemctl status wg-quick@${WG_INTERFACE}."
+
+    info "Repaired forwarding and NAT using outbound interface $WG_OUT_INTERFACE."
+    info "Reconnect the client, then run: sudo $PROGRAM doctor"
+}
+
+print_config() {
+    require_root
+    load_state
+    printf 'Interface:          %s\n' "$WG_INTERFACE"
+    printf 'Listen port:        %s/udp\n' "$WG_PORT"
+    printf 'Public endpoint:    %s\n' "$WG_ENDPOINT"
+    printf 'Tunnel subnet:      %s\n' "$WG_SUBNET"
+    printf 'Server address:     %s\n' "$WG_SERVER_ADDRESS"
+    printf 'Client DNS:         %s\n' "$WG_DNS"
+    printf 'Outbound interface: %s\n' "$WG_OUT_INTERFACE"
+    printf 'Service state:      %s\n' "$(interface_is_up && printf up || printf down)"
+}
+
+usage() {
+    cat <<USAGE
+$PROGRAM $VERSION - WireGuard server and user manager
+
+Usage:
+  sudo $PROGRAM install --endpoint <host-or-ip> [options]
+  sudo $PROGRAM add <username>
+  sudo $PROGRAM delete <username>
+  sudo $PROGRAM list
+  sudo $PROGRAM traffic [username]
+  sudo $PROGRAM traffic-user <username>
+  sudo $PROGRAM active [seconds]
+  sudo $PROGRAM qr <username>
+  sudo $PROGRAM dns "<server1, server2>"
+  sudo $PROGRAM doctor
+  sudo $PROGRAM repair-network
+  sudo $PROGRAM config
+
+Install options:
+  --endpoint <value>    Public hostname or IP. A :port suffix is accepted.
+  --port <1-65535>      UDP listen port (default: $DEFAULT_PORT).
+  --subnet <x.x.x.0/24> Private client subnet (default: $DEFAULT_SUBNET).
+  --dns <servers>       Comma-separated client DNS values (default: $DEFAULT_DNS).
+  --interface <name>    WireGuard interface (default: $DEFAULT_INTERFACE).
+
+Examples:
+  sudo $PROGRAM install --endpoint vpn.example.com
+  sudo $PROGRAM add alice
+  sudo $PROGRAM traffic alice
+  sudo $PROGRAM active 300
+  sudo $PROGRAM qr alice
+  sudo $PROGRAM dns "9.9.9.9, 149.112.112.112"
+  sudo $PROGRAM doctor
+  sudo $PROGRAM repair-network
+USAGE
+}
+
+interactive_menu() {
+    cat <<'MENU'
+
+WireGuard Manager
+1) Install WireGuard server
+2) Add user
+3) Delete user
+4) List users
+5) Show all traffic
+6) Show traffic for one user
+7) Show active users
+8) Show a user's QR code
+9) Configure DNS for all users
+10) Show manager configuration
+11) Diagnose tunneling
+12) Repair forwarding/NAT
+0) Exit
+MENU
+    local choice value endpoint
+    read -r -p "Select: " choice
+    case $choice in
+        1)
+            read -r -p "Public hostname or IP: " endpoint
+            cmd_install --endpoint "$endpoint"
+            ;;
+        2)
+            read -r -p "Username: " value
+            cmd_add "$value"
+            ;;
+        3)
+            read -r -p "Username: " value
+            cmd_delete "$value"
+            ;;
+        4) cmd_list ;;
+        5) cmd_traffic ;;
+        6)
+            read -r -p "Username: " value
+            cmd_traffic_user "$value"
+            ;;
+        7)
+            read -r -p "Active threshold in seconds [$DEFAULT_ACTIVE_SECONDS]: " value
+            cmd_active "${value:-$DEFAULT_ACTIVE_SECONDS}"
+            ;;
+        8)
+            read -r -p "Username: " value
+            cmd_qr "$value"
+            ;;
+        9)
+            read -r -p "DNS servers: " value
+            cmd_dns "$value"
+            ;;
+        10) print_config ;;
+        11) cmd_doctor ;;
+        12) cmd_repair_network ;;
+        0) exit 0 ;;
+        *) die "Invalid selection." ;;
+    esac
+}
+
+main() {
+    require_bash4
+    local command=${1:-}
+    if [[ -z $command ]]; then
+        if [[ -t 0 ]]; then
+            interactive_menu
+        else
+            usage
+        fi
+        return
+    fi
+    shift || true
+
+    case $command in
+        install)      cmd_install "$@" ;;
+        add)          cmd_add "$@" ;;
+        delete|del|remove) cmd_delete "$@" ;;
+        list|users)   cmd_list "$@" ;;
+        traffic)      cmd_traffic "$@" ;;
+        traffic-user|user-traffic) cmd_traffic_user "$@" ;;
+        active)       cmd_active "$@" ;;
+        qr)           cmd_qr "$@" ;;
+        dns)          cmd_dns "$@" ;;
+        doctor|diagnose) cmd_doctor "$@" ;;
+        repair-network|repair) cmd_repair_network "$@" ;;
+        config)       print_config "$@" ;;
+        help|-h|--help) usage ;;
+        *)
+            usage >&2
+            die "Unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
