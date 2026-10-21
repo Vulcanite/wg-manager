@@ -378,11 +378,15 @@ PEER
 remove_peer_block() {
     local username=$1 tmp
     tmp=$(mktemp "${SERVER_CONFIG}.XXXXXX")
-    awk -v begin="# BEGIN_PEER $username" -v end="# END_PEER $username" '
+    if ! awk -v begin="# BEGIN_PEER $username" -v end="# END_PEER $username" '
         $0 == begin { skipping=1; next }
         $0 == end   { skipping=0; next }
         !skipping   { print }
-    ' "$SERVER_CONFIG" > "$tmp"
+        END         { if (skipping) exit 2 }
+    ' "$SERVER_CONFIG" > "$tmp"; then
+        rm -f -- "$tmp"
+        die "$SERVER_CONFIG has '# BEGIN_PEER $username' without a matching '# END_PEER $username'; fix the file by hand. Nothing was changed."
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$SERVER_CONFIG"
 }
@@ -468,10 +472,10 @@ cmd_delete() {
 
     local public_key
     public_key=$(<"$user_dir/public.key")
+    remove_peer_block "$username"
     if interface_is_up; then
         wg set "$WG_INTERFACE" peer "$public_key" remove
     fi
-    remove_peer_block "$username"
     rm -rf -- "$user_dir"
 
     info "Deleted user '$username'."
