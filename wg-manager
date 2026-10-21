@@ -61,7 +61,7 @@ command_exists() {
 }
 
 detect_out_interface() {
-    local target=${1:-1.1.1.1}
+    local target=1.1.1.1
     ip -4 route get "$target" 2>/dev/null | awk '
         {
             for (i = 1; i <= NF; i++) {
@@ -491,8 +491,8 @@ load_runtime_stats() {
     STAT_RX=()
     STAT_TX=()
 
-    local first=1 public_key psk endpoint allowed_ips handshake rx tx keepalive
-    while IFS=$'\t' read -r public_key psk endpoint allowed_ips handshake rx tx keepalive; do
+    local first=1 public_key psk endpoint handshake rx tx
+    while IFS=$'\t' read -r public_key psk endpoint _ handshake rx tx _; do
         if (( first )); then
             first=0
             continue
