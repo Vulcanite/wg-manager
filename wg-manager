@@ -7,7 +7,7 @@ IFS=$'\n\t'
 umask 077
 
 PROGRAM=${0##*/}
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 BASE_DIR="/etc/wireguard/wg-manager"
 STATE_FILE="$BASE_DIR/settings.conf"

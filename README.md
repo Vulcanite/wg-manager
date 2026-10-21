@@ -89,6 +89,26 @@ Directories are mode 700 and files mode 600, owned by root. If a run is killed a
 
 Traffic counters come from the kernel and reset when the interface is restarted or the server reboots.
 
+## IPv6
+
+The server only carries IPv4. Before 1.1.1, client configs had `AllowedIPs = 0.0.0.0/0`, so on a network with IPv6 the client sent its IPv6 traffic straight out over that network, outside the VPN.
+
+From 1.1.1, `add` writes `AllowedIPs = 0.0.0.0/0, ::/0`. IPv6 traffic now goes into the tunnel, and the server drops it because it has no IPv6 address or route for clients. While connected, a client has no IPv6; apps fall back to IPv4. DNS is unaffected: the default servers (`1.1.1.1, 1.0.0.1`) are IPv4 and go through the tunnel.
+
+Configs created before 1.1.1 are not changed by the upgrade, and `qr` still prints the stored config as it is (it now prints a note when the config is an old one). For each existing client, either edit the `[Peer]` section on the device so that
+
+```
+AllowedIPs = 0.0.0.0/0
+```
+
+becomes
+
+```
+AllowedIPs = 0.0.0.0/0, ::/0
+```
+
+or make the same edit in `/etc/wireguard/wg-manager/users/<name>/<name>.conf` on the server, run `sudo wg-manager qr <name>` to regenerate the QR code, and re-import the profile on the device. Nothing changes on the server side for existing peers.
+
 ## Uninstall
 
 There is no uninstall command. With the default interface name and port:
@@ -114,7 +134,7 @@ The same steps clean up after an install that failed halfway, since `install` re
 - The server keeps every client's private key, pre-shared key, config and QR image under `/etc/wireguard/wg-manager/users`. Anyone with root on the server can read them and connect as that user. `delete` removes them. Keys are not generated on the client device.
 - The client config and QR code contain the client's private key. `add` and `qr` print the QR code to the terminal, so mind screen sharing and terminal logs. Send `.conf` files over a private channel.
 - Each user gets their own pre-shared key in addition to the key pair.
-- Client configs route `0.0.0.0/0` through the tunnel. IPv6 is not configured, so on a network with IPv6 a client's IPv6 traffic does not go through the VPN.
+- Client configs route `0.0.0.0/0, ::/0` through the tunnel. The server is IPv4-only, so IPv6 traffic from a connected client goes into the tunnel and is dropped there instead of leaving over the local network. See [IPv6](#ipv6).
 - Firewall changes made by the script:
   - `install` opens the UDP port with `ufw allow` or `firewall-cmd --permanent --add-port` if UFW or firewalld is active. Otherwise it changes nothing for incoming traffic and prints a reminder; if your host's INPUT chain rejects unknown traffic (some cloud images do), allow the UDP port yourself.
   - `PostUp` inserts two FORWARD rules at the top of the chain (tunnel to internet, and established return traffic) and appends a MASQUERADE rule for the tunnel subnet. `PostDown` removes them.
@@ -134,10 +154,33 @@ This table separates what has been run from what has only been read.
 | ShellCheck | Runs in CI on every push (`.github/workflows/lint.yml`) | Not run locally yet |
 | Debian | apt path, same as Ubuntu | Untested |
 | Fedora / RHEL / Rocky / Alma | dnf path (`yum` fallback for old releases) | Untested. On RHEL-family systems `qrencode` may need EPEL, which the dnf path does not enable. With firewalld active, its own forward rules may block client traffic even though the iptables rules are present. |
-| Arch | pacman path | Untested. Uses `pacman -Sy`, which Arch does not support as a partial upgrade, and the `iptables` package may conflict with an installed `iptables-nft`. |
+| Arch | pacman path | Untested. Uses `pacman -S --needed` without refreshing the package databases; if they are stale, run `pacman -Syu` first. The `iptables` package may conflict with an installed `iptables-nft`. |
 | openSUSE | zypper path | Untested. Same firewalld caveat as Fedora. |
 
 If you run it on one of the untested systems, an issue with the result (working or not) is welcome.
+
+## Known limitations
+
+- IPv4 only on the server. Clients get no IPv6 while connected (see [IPv6](#ipv6)).
+- With firewalld active on Fedora, RHEL-family or openSUSE, `install` opens the UDP port, but firewalld's own forwarding policy may still block client traffic to the internet even though the script's iptables rules are in place. This has not been tested.
+- The `yum` path (EL7 and similar) is effectively unsupported: those releases are end of life, their kernels lack built-in WireGuard, and the path has never been run.
+- No uninstall command. See [Uninstall](#uninstall) for the manual steps.
+
+## Changes
+
+### 1.1.1
+
+- Client configs route `::/0` as well as `0.0.0.0/0`, so IPv6 no longer bypasses the VPN. Existing configs need a one-line edit (see [IPv6](#ipv6)); `qr` points this out for old configs.
+- Arch: install uses `pacman -S --needed` instead of `pacman -Sy`, which was an unsupported partial upgrade.
+- `install` puts its FORWARD rules at the top of the chain, as `repair-network` already did. Before, on hosts whose FORWARD chain ends in a REJECT rule (Oracle Cloud Ubuntu images ship one), clients connected but had no internet until `repair-network` was run.
+- `install` validates the endpoint before installing any packages, and a bracketed IPv6 endpoint without a port (`[2001:db8::1]`) is written as `[2001:db8::1]:51820` instead of `[[2001:db8::1]]:51820`.
+- Overlong port numbers and zero-padded subnet octets are rejected.
+- `delete` refuses to rewrite the server config if the user's `# END_PEER` marker is missing, instead of dropping everything after it.
+- The lock is kept in root-only `/run` instead of world-writable `/run/lock`.
+
+### 1.1.0
+
+The version that was running on the original server, imported as is.
 
 ## License
 
