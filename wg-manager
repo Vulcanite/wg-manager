@@ -444,7 +444,7 @@ DNS = $WG_DNS
 PublicKey = $server_public
 PresharedKey = $psk
 Endpoint = $WG_ENDPOINT
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 CLIENT
     chmod 600 "$user_dir/${username}.conf"
@@ -695,6 +695,10 @@ cmd_qr() {
     [[ -d $USERS_DIR/$username ]] || die "Unknown user: $username"
     generate_qr_png "$username"
     show_qr "$username"
+    if ! grep -Eq '^AllowedIPs[[:space:]]*=.*::/0' "$USERS_DIR/$username/${username}.conf"; then
+        info "This profile predates 1.1.1 and does not route IPv6 through the tunnel."
+        info "Edit the client's AllowedIPs line to: AllowedIPs = 0.0.0.0/0, ::/0"
+    fi
 }
 
 cmd_dns() {
