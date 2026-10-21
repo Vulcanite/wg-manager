@@ -153,7 +153,7 @@ install_packages() {
         yum install -y epel-release || true
         yum install -y wireguard-tools qrencode iproute iptables
     elif command_exists pacman; then
-        pacman -Sy --noconfirm --needed wireguard-tools qrencode iproute2 iptables
+        pacman -S --noconfirm --needed wireguard-tools qrencode iproute2 iptables
     elif command_exists zypper; then
         zypper --non-interactive install wireguard-tools qrencode iproute2 iptables
     else
