@@ -127,6 +127,8 @@ normalize_endpoint() {
         port=${BASH_REMATCH[2]}
         validate_port "$port"
         printf '[%s]:%s\n' "$host" "$port"
+    elif [[ $value =~ ^\[(.*)\]$ ]]; then
+        printf '[%s]:%s\n' "${BASH_REMATCH[1]}" "$default_port"
     elif [[ $value =~ ^([^:]+):([0-9]+)$ ]]; then
         host=${BASH_REMATCH[1]}
         port=${BASH_REMATCH[2]}
@@ -275,6 +277,9 @@ cmd_install() {
     validate_dns "$dns"
     validate_interface "$iface"
 
+    local normalized_endpoint
+    normalized_endpoint=$(normalize_endpoint "$endpoint" "$port")
+
     [[ ! -e $STATE_FILE ]] || die "This manager is already installed."
     if [[ -e /etc/wireguard/${iface}.conf ]]; then
         die "/etc/wireguard/${iface}.conf already exists; refusing to overwrite an unmanaged configuration."
@@ -284,7 +289,7 @@ cmd_install() {
 
     WG_INTERFACE=$iface
     WG_PORT=$port
-    WG_ENDPOINT=$(normalize_endpoint "$endpoint" "$port")
+    WG_ENDPOINT=$normalized_endpoint
     WG_SUBNET=$subnet
     WG_PREFIX=$(subnet_prefix "$subnet")
     WG_SERVER_ADDRESS="${WG_PREFIX}.1/24"
