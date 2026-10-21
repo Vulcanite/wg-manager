@@ -1,0 +1,13 @@
+# Never commit WireGuard material produced while testing
+*.conf
+*.key
+*.png
+users/
+settings.conf
+
+# Editor and OS files
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
