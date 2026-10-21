@@ -1,0 +1,22 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n
+        run: bash -n wg-manager
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck wg-manager
