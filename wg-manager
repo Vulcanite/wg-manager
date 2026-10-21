@@ -306,7 +306,7 @@ cmd_install() {
 Address = $WG_SERVER_ADDRESS
 ListenPort = $WG_PORT
 PrivateKey = $server_private
-PostUp = iptables -w -C FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || iptables -w -A FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT; iptables -w -C FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -A FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE
+PostUp = iptables -w -C FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o $WG_OUT_INTERFACE -j ACCEPT; iptables -w -C FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE
 PostDown = iptables -w -D FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t nat -D POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || true
 CONFIG
     chmod 600 "$SERVER_CONFIG"
