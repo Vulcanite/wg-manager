@@ -2,6 +2,16 @@
 
 `wg-manager` is a single Bash script that sets up a WireGuard VPN server on a systemd-based Linux machine and manages its users. It installs the packages, writes the server config, enables IPv4 forwarding and NAT, and then lets you add and remove users, print a client config as a QR code, and see per-user traffic and last handshake. All state is plain files under `/etc/wireguard`; there is no daemon or database.
 
+## Why I built this
+
+I didn't want to depend on VPN providers like NordVPN or Surfshark. I just wanted a VPN built from the free resources available online.
+
+With Oracle Cloud's free tier I got access to three machines: two x86 machines with 1 GB of RAM, and one Arm machine with 2 cores and 12 GB of RAM. I use one of the 1 GB machines for this. The script installs WireGuard, adds and removes users, generates a QR code for each user, and shows basic traffic stats, so you can see how much data is going through the VPN.
+
+That is good enough for a simple WireGuard network. A lot of people don't know that you can set up your own VPN server with free resources. You don't get a choice of region, but that depends on your account. I live in Singapore, but because my main address is in India, my Oracle account is in India. If you get a free server anywhere else, the script works the same.
+
+The purpose of the project is a simple script that installs WireGuard, adds users to your server and gives each one a QR code. Then you scan the QR code with the WireGuard app (available on both the iOS and Android app stores), and it imports the configuration into your phone straight away. You can also set your own DNS server.
+
 ## Requirements
 
 - Linux with systemd (`wg-quick@.service` is used to run the interface)
