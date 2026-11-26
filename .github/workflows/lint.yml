@@ -19,4 +19,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck wg-manager
+          shellcheck -x wg-manager tests/run.sh
+
+      - name: tests
+        run: bash tests/run.sh

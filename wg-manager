@@ -7,7 +7,7 @@ IFS=$'\n\t'
 umask 077
 
 PROGRAM=${0##*/}
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 BASE_DIR="/etc/wireguard/wg-manager"
 STATE_FILE="$BASE_DIR/settings.conf"
@@ -20,6 +20,8 @@ DEFAULT_DNS="1.1.1.1, 1.0.0.1"
 DEFAULT_ACTIVE_SECONDS="180"
 
 LOCK_HELD=0
+PENDING_USER=""
+PENDING_KEY=""
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -31,6 +33,15 @@ info() {
 }
 
 cleanup() {
+    # A failed add leaves nothing behind: no user folder, peer block or runtime peer.
+    if [[ -n $PENDING_USER ]]; then
+        [[ -z $PENDING_KEY ]] || wg set "$WG_INTERFACE" peer "$PENDING_KEY" remove 2>/dev/null || true
+        if grep -qxF "# BEGIN_PEER $PENDING_USER" "$SERVER_CONFIG" 2>/dev/null; then
+            ( remove_peer_block "$PENDING_USER" ) || true
+        fi
+        rm -rf -- "${USERS_DIR:?}/$PENDING_USER"
+        printf 'Rolled back the partly added user %s.\n' "$PENDING_USER" >&2
+    fi
     if (( LOCK_HELD )); then
         rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
@@ -140,22 +151,20 @@ normalize_endpoint() {
     fi
 }
 
+# Extra package names (for example unbound) are installed alongside the base set.
 install_packages() {
     info "Installing WireGuard and required utilities..."
 
     if command_exists apt-get; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y wireguard wireguard-tools qrencode iproute2 iptables
+        apt-get install -y wireguard wireguard-tools qrencode iproute2 iptables "$@"
     elif command_exists dnf; then
-        dnf install -y wireguard-tools qrencode iproute iptables
-    elif command_exists yum; then
-        yum install -y epel-release || true
-        yum install -y wireguard-tools qrencode iproute iptables
+        dnf install -y wireguard-tools qrencode iproute iptables "$@"
     elif command_exists pacman; then
-        pacman -S --noconfirm --needed wireguard-tools qrencode iproute2 iptables
+        pacman -S --noconfirm --needed wireguard-tools qrencode iproute2 iptables "$@"
     elif command_exists zypper; then
-        zypper --non-interactive install wireguard-tools qrencode iproute2 iptables
+        zypper --non-interactive install wireguard-tools qrencode iproute2 iptables "$@"
     else
         die "Unsupported package manager. Install wireguard-tools, qrencode, iproute2, and iptables manually."
     fi
@@ -180,6 +189,7 @@ load_state() {
     : "${WG_SERVER_ADDRESS:?Missing WG_SERVER_ADDRESS in settings}"
     : "${WG_DNS:?Missing WG_DNS in settings}"
     : "${WG_OUT_INTERFACE:?Missing WG_OUT_INTERFACE in settings}"
+    WG_ENCRYPTED_DNS=${WG_ENCRYPTED_DNS:-0}
 
     SERVER_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
 }
@@ -196,6 +206,7 @@ write_state() {
         printf 'WG_SERVER_ADDRESS=%q\n' "$WG_SERVER_ADDRESS"
         printf 'WG_DNS=%q\n' "$WG_DNS"
         printf 'WG_OUT_INTERFACE=%q\n' "$WG_OUT_INTERFACE"
+        printf 'WG_ENCRYPTED_DNS=%q\n' "$WG_ENCRYPTED_DNS"
     } > "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$STATE_FILE"
@@ -214,8 +225,167 @@ open_host_firewall() {
         firewall-cmd --reload
         info "Opened UDP port $WG_PORT in firewalld."
     else
-        info "No active UFW/firewalld installation detected. Ensure UDP port $WG_PORT is allowed by the host and cloud firewall."
+        info "No active UFW/firewalld installation detected. The interface's PostUp rule opens UDP port $WG_PORT in iptables; also allow it in the cloud firewall."
     fi
+}
+
+# One rule per line: "<table> <I|A> <chain> <match...>". %i is the WireGuard interface.
+# This is the single source for the PostUp/PostDown hooks, live changes and doctor.
+firewall_rules() {
+    local out=${1:-$WG_OUT_INTERFACE}
+    printf '%s\n' \
+        "filter I INPUT -p udp --dport $WG_PORT -j ACCEPT" \
+        "filter I FORWARD -i %i -o $out -j ACCEPT" \
+        "filter I FORWARD -i $out -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "nat A POSTROUTING -s $WG_SUBNET -o $out -j MASQUERADE"
+    if (( WG_ENCRYPTED_DNS )); then
+        dns_firewall_rules
+    fi
+}
+
+dns_firewall_rules() {
+    printf '%s\n' \
+        "filter I INPUT -i %i -p udp --dport 53 -j ACCEPT" \
+        "filter I INPUT -i %i -p tcp --dport 53 -j ACCEPT"
+}
+
+hook_lines() {
+    local table action rule up="" down=""
+    while IFS=' ' read -r table action rule; do
+        up+="${up:+; }iptables -w -t $table -C $rule 2>/dev/null || iptables -w -t $table -$action $rule"
+        down+="${down:+; }iptables -w -t $table -D $rule 2>/dev/null || true"
+    done < <(firewall_rules)
+    printf 'PostUp = %s\nPostDown = %s\n' "$up" "$down"
+}
+
+# Reads rules on stdin and adds (if missing) or deletes them on the running system.
+apply_firewall_rules() {
+    local mode=$1 table action rule
+    local -a args
+    while IFS=' ' read -r table action rule; do
+        IFS=' ' read -ra args <<< "${rule//%i/$WG_INTERFACE}"
+        if [[ $mode == add ]]; then
+            iptables -w -t "$table" -C "${args[@]}" 2>/dev/null || iptables -w -t "$table" "-$action" "${args[@]}"
+        else
+            iptables -w -t "$table" -D "${args[@]}" 2>/dev/null || true
+        fi
+    done
+}
+
+write_hooks() {
+    local hooks tmp
+    grep -q '^PostUp[[:space:]]*=' "$SERVER_CONFIG" || die "$SERVER_CONFIG has no PostUp line; fix the file by hand."
+    hooks=$(hook_lines)
+    tmp=$(mktemp "${SERVER_CONFIG}.XXXXXX")
+    awk -v hooks="$hooks" '
+        /^PostUp[[:space:]]*=/   { print hooks; next }
+        /^PostDown[[:space:]]*=/ { next }
+        { print }
+    ' "$SERVER_CONFIG" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SERVER_CONFIG"
+}
+
+enable_forwarding() {
+    printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-wireguard-forward.conf
+    chmod 644 /etc/sysctl.d/99-wireguard-forward.conf
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+
+install_resolver_packages() {
+    local had_unbound=0
+    if command_exists unbound; then
+        had_unbound=1
+    fi
+    install_packages unbound
+    if (( ! had_unbound )); then
+        # The package enables its own resolver on 127.0.0.1; this script runs a separate one.
+        systemctl disable --now unbound.service unbound-resolvconf.service 2>/dev/null || true
+    fi
+}
+
+resolver_unit() {
+    printf 'wg-manager-dns-%s.service\n' "$WG_INTERFACE"
+}
+
+resolver_conf() {
+    printf '/etc/unbound/wg-manager-%s.conf\n' "$WG_INTERFACE"
+}
+
+# A private unbound instance on the tunnel address that forwards every query
+# over DNS-over-TLS, so lookups leave the server encrypted.
+setup_resolver() {
+    local unbound_bin bundle="" candidate conf unit
+    unbound_bin=$(command -v unbound) || die "unbound is not installed."
+    for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem; do
+        if [[ -r $candidate ]]; then
+            bundle=$candidate
+            break
+        fi
+    done
+    [[ -n $bundle ]] || die "No CA certificate bundle found; DNS-over-TLS needs one."
+    conf=$(resolver_conf)
+    unit=$(resolver_unit)
+
+    mkdir -p /etc/unbound
+    cat > "$conf" <<UNBOUND
+# Managed by $PROGRAM. DNS-over-TLS resolver for $WG_INTERFACE clients.
+server:
+    interface: ${WG_SERVER_ADDRESS%/*}
+    port: 53
+    ip-freebind: yes
+    access-control: 0.0.0.0/0 refuse
+    access-control: $WG_SUBNET allow
+    do-ip6: no
+    chroot: ""
+    pidfile: ""
+    num-threads: 1
+    msg-cache-size: 4m
+    rrset-cache-size: 8m
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+    tls-cert-bundle: $bundle
+
+remote-control:
+    control-enable: no
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    forward-addr: 1.1.1.1@853#cloudflare-dns.com
+    forward-addr: 1.0.0.1@853#cloudflare-dns.com
+    forward-addr: 9.9.9.9@853#dns.quad9.net
+    forward-addr: 149.112.112.112@853#dns.quad9.net
+UNBOUND
+    chmod 644 "$conf"
+    unbound-checkconf "$conf" >/dev/null || die "unbound rejected $conf."
+
+    cat > "/etc/systemd/system/$unit" <<UNIT
+[Unit]
+Description=$PROGRAM DNS-over-TLS resolver for $WG_INTERFACE
+After=network-online.target wg-quick@${WG_INTERFACE}.service
+Wants=network-online.target
+
+[Service]
+ExecStart=$unbound_bin -d -p -c $conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 644 "/etc/systemd/system/$unit"
+    systemctl daemon-reload
+    systemctl enable --now "$unit"
+    systemctl is-active --quiet "$unit" || die "The resolver did not start. Check: journalctl -u $unit"
+}
+
+remove_resolver() {
+    local unit
+    unit=$(resolver_unit)
+    systemctl disable --now "$unit" 2>/dev/null || true
+    rm -f -- "/etc/systemd/system/$unit" "$(resolver_conf)"
+    systemctl daemon-reload
 }
 
 cmd_install() {
@@ -223,7 +393,7 @@ cmd_install() {
     require_systemd
     acquire_lock
 
-    local endpoint="" port=$DEFAULT_PORT subnet=$DEFAULT_SUBNET dns=$DEFAULT_DNS iface=$DEFAULT_INTERFACE
+    local endpoint="" port=$DEFAULT_PORT subnet=$DEFAULT_SUBNET dns="" iface=$DEFAULT_INTERFACE encrypted=0
 
     while (( $# )); do
         case $1 in
@@ -252,6 +422,10 @@ cmd_install() {
                 iface=$2
                 shift 2
                 ;;
+            --encrypted-dns)
+                encrypted=1
+                shift
+                ;;
             -h|--help)
                 usage
                 return 0
@@ -273,7 +447,12 @@ cmd_install() {
     [[ -n $endpoint && $endpoint != *[[:space:]]* ]] || die "Endpoint must not be empty or contain whitespace."
     validate_port "$port"
     validate_subnet_24 "$subnet"
-    validate_dns "$dns"
+    if (( encrypted )); then
+        [[ -z $dns ]] || die "--dns and --encrypted-dns cannot be combined; clients use the server's resolver."
+    else
+        dns=${dns:-$DEFAULT_DNS}
+        validate_dns "$dns"
+    fi
     validate_interface "$iface"
 
     local normalized_endpoint
@@ -284,7 +463,11 @@ cmd_install() {
         die "/etc/wireguard/${iface}.conf already exists; refusing to overwrite an unmanaged configuration."
     fi
 
-    install_packages
+    if (( encrypted )); then
+        install_resolver_packages
+    else
+        install_packages
+    fi
 
     WG_INTERFACE=$iface
     WG_PORT=$port
@@ -292,7 +475,8 @@ cmd_install() {
     WG_SUBNET=$subnet
     WG_PREFIX=$(subnet_prefix "$subnet")
     WG_SERVER_ADDRESS="${WG_PREFIX}.1/24"
-    WG_DNS=$dns
+    WG_ENCRYPTED_DNS=$encrypted
+    WG_DNS=${dns:-${WG_SERVER_ADDRESS%/*}}
     WG_OUT_INTERFACE=$(detect_out_interface)
     [[ -n $WG_OUT_INTERFACE ]] || die "Could not detect the default outbound network interface."
     SERVER_CONFIG="/etc/wireguard/${WG_INTERFACE}.conf"
@@ -310,16 +494,11 @@ cmd_install() {
 Address = $WG_SERVER_ADDRESS
 ListenPort = $WG_PORT
 PrivateKey = $server_private
-PostUp = iptables -w -C FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o $WG_OUT_INTERFACE -j ACCEPT; iptables -w -C FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE
-PostDown = iptables -w -D FORWARD -i %i -o $WG_OUT_INTERFACE -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i $WG_OUT_INTERFACE -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t nat -D POSTROUTING -s $WG_SUBNET -o $WG_OUT_INTERFACE -j MASQUERADE 2>/dev/null || true
+$(hook_lines)
 CONFIG
     chmod 600 "$SERVER_CONFIG"
 
-    cat > /etc/sysctl.d/99-wireguard-forward.conf <<'SYSCTL'
-net.ipv4.ip_forward = 1
-SYSCTL
-    chmod 644 /etc/sysctl.d/99-wireguard-forward.conf
-    sysctl -q -w net.ipv4.ip_forward=1
+    enable_forwarding
 
     write_state
     printf '%s\n' "$server_public" > "$BASE_DIR/server-public.key"
@@ -329,12 +508,16 @@ SYSCTL
 
     systemctl enable --now "wg-quick@${WG_INTERFACE}.service"
     interface_is_up || die "WireGuard service did not start successfully. Check: systemctl status wg-quick@${WG_INTERFACE}"
+    if (( WG_ENCRYPTED_DNS )); then
+        setup_resolver
+    fi
 
     info ""
     info "WireGuard installed successfully."
     info "Interface: $WG_INTERFACE"
     info "Server tunnel address: $WG_SERVER_ADDRESS"
     info "Public endpoint: $WG_ENDPOINT"
+    info "Client DNS: $WG_DNS$( (( WG_ENCRYPTED_DNS )) && printf ' (DNS-over-TLS resolver on this server)')"
     info "Server public key: $server_public"
     info ""
     info "Add a user with: sudo $PROGRAM add <username>"
@@ -422,6 +605,7 @@ cmd_add() {
     user_dir="$USERS_DIR/$username"
     mkdir -p "$user_dir"
     chmod 700 "$user_dir"
+    PENDING_USER=$username
 
     private_key=$(wg genkey)
     public_key=$(printf '%s' "$private_key" | wg pubkey)
@@ -449,9 +633,12 @@ PersistentKeepalive = 25
 CLIENT
     chmod 600 "$user_dir/${username}.conf"
 
+    PENDING_KEY=$public_key
     wg set "$WG_INTERFACE" peer "$public_key" preshared-key "$user_dir/preshared.key" allowed-ips "$ip/32"
     append_peer_block "$username" "$public_key" "$psk" "$ip"
     generate_qr_png "$username"
+    PENDING_USER=""
+    PENDING_KEY=""
 
     info "Added user '$username' with address $ip."
     show_qr "$username"
@@ -711,8 +898,15 @@ cmd_dns() {
         read -r -p "DNS servers for all client profiles: " dns
     fi
     validate_dns "$dns"
+    if (( WG_ENCRYPTED_DNS )); then
+        info "Note: the encrypted DNS resolver stays on; turn it off with: sudo $PROGRAM encrypted-dns off"
+    fi
+    set_client_dns "$dns"
+}
 
-    WG_DNS=$dns
+# Saves the DNS setting and rewrites the DNS line of every client profile.
+set_client_dns() {
+    WG_DNS=$1
     write_state
 
     local user_dir username config tmp count=0
@@ -723,14 +917,9 @@ cmd_dns() {
         [[ -r $config ]] || continue
         tmp=$(mktemp "$user_dir/.config.XXXXXX")
         awk -v dns="$WG_DNS" '
-            BEGIN { replaced=0 }
-            /^DNS[[:space:]]*=/ { print "DNS = " dns; replaced=1; next }
+            /^DNS[[:space:]]*=/ { if (!done) print "DNS = " dns; done=1; next }
+            /^\[Peer\]/ && !done { print "DNS = " dns; print ""; done=1 }
             { print }
-            END {
-                if (!replaced) {
-                    # Profiles created by this script always have DNS; this is a safety fallback.
-                }
-            }
         ' "$config" > "$tmp"
         chmod 600 "$tmp"
         mv -f "$tmp" "$config"
@@ -785,25 +974,26 @@ cmd_doctor() {
         failures=$(( failures + 1 ))
     fi
 
-    if iptables -w -t nat -C POSTROUTING -s "$WG_SUBNET" -o "$WG_OUT_INTERFACE" -j MASQUERADE 2>/dev/null; then
-        check_ok "NAT masquerading rule is installed."
-    else
-        check_fail "NAT masquerading rule is missing."
-        failures=$(( failures + 1 ))
-    fi
+    local table rule
+    local -a args
+    while IFS=' ' read -r table _ rule; do
+        rule=${rule//%i/$WG_INTERFACE}
+        IFS=' ' read -ra args <<< "$rule"
+        if iptables -w -t "$table" -C "${args[@]}" 2>/dev/null; then
+            check_ok "Firewall rule present: $rule"
+        else
+            check_fail "Firewall rule missing: $rule"
+            failures=$(( failures + 1 ))
+        fi
+    done < <(firewall_rules)
 
-    if iptables -w -C FORWARD -i "$WG_INTERFACE" -o "$WG_OUT_INTERFACE" -j ACCEPT 2>/dev/null; then
-        check_ok "Client-to-internet forwarding rule is installed."
-    else
-        check_fail "Client-to-internet forwarding rule is missing."
-        failures=$(( failures + 1 ))
-    fi
-
-    if iptables -w -C FORWARD -i "$WG_OUT_INTERFACE" -o "$WG_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-        check_ok "Return-traffic forwarding rule is installed."
-    else
-        check_fail "Return-traffic forwarding rule is missing."
-        failures=$(( failures + 1 ))
+    if (( WG_ENCRYPTED_DNS )); then
+        if systemctl is-active --quiet "$(resolver_unit)"; then
+            check_ok "Encrypted DNS resolver $(resolver_unit) is running on ${WG_SERVER_ADDRESS%/*}."
+        else
+            check_fail "Encrypted DNS resolver $(resolver_unit) is not running."
+            failures=$(( failures + 1 ))
+        fi
     fi
 
     if interface_is_up; then
@@ -812,7 +1002,7 @@ cmd_doctor() {
         recent_count=0
         while IFS=$'\t' read -r _ _ _ _ handshake _ _ _; do
             peer_count=$(( peer_count + 1 ))
-            if [[ $handshake =~ ^[0-9]+$ ]] && (( handshake > 0 && now - handshake <= 180 )); then
+            if [[ $handshake =~ ^[0-9]+$ ]] && (( handshake > 0 && now - handshake <= DEFAULT_ACTIVE_SECONDS )); then
                 recent_count=$(( recent_count + 1 ))
             fi
         done < <(wg show "$WG_INTERFACE" dump | tail -n +2)
@@ -836,44 +1026,55 @@ cmd_repair_network() {
     load_state
     acquire_lock
 
-    local old_out=$WG_OUT_INTERFACE new_out tmp
+    local new_out
     new_out=$(detect_out_interface) || true
     [[ -n $new_out ]] || die "Could not detect the current outbound IPv4 interface."
 
     # Remove rules tied to the previously saved interface before changing it.
-    iptables -w -D FORWARD -i "$WG_INTERFACE" -o "$old_out" -j ACCEPT 2>/dev/null || true
-    iptables -w -D FORWARD -i "$old_out" -o "$WG_INTERFACE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    iptables -w -t nat -D POSTROUTING -s "$WG_SUBNET" -o "$old_out" -j MASQUERADE 2>/dev/null || true
+    apply_firewall_rules delete < <(firewall_rules)
 
     WG_OUT_INTERFACE=$new_out
     write_state
-
-    tmp=$(mktemp "${SERVER_CONFIG}.XXXXXX")
-    awk -v out="$WG_OUT_INTERFACE" -v subnet="$WG_SUBNET" '
-        /^PostUp[[:space:]]*=/ {
-            print "PostUp = iptables -w -C FORWARD -i %i -o " out " -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i %i -o " out " -j ACCEPT; iptables -w -C FORWARD -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -w -I FORWARD 1 -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -w -t nat -C POSTROUTING -s " subnet " -o " out " -j MASQUERADE 2>/dev/null || iptables -w -t nat -A POSTROUTING -s " subnet " -o " out " -j MASQUERADE"
-            next
-        }
-        /^PostDown[[:space:]]*=/ {
-            print "PostDown = iptables -w -D FORWARD -i %i -o " out " -j ACCEPT 2>/dev/null || true; iptables -w -D FORWARD -i " out " -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -w -t nat -D POSTROUTING -s " subnet " -o " out " -j MASQUERADE 2>/dev/null || true"
-            next
-        }
-        { print }
-    ' "$SERVER_CONFIG" > "$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$SERVER_CONFIG"
-
-    cat > /etc/sysctl.d/99-wireguard-forward.conf <<'SYSCTL'
-net.ipv4.ip_forward = 1
-SYSCTL
-    chmod 644 /etc/sysctl.d/99-wireguard-forward.conf
-    sysctl -q -w net.ipv4.ip_forward=1
+    write_hooks
+    enable_forwarding
 
     systemctl restart "wg-quick@${WG_INTERFACE}.service"
     interface_is_up || die "WireGuard did not restart successfully. Check systemctl status wg-quick@${WG_INTERFACE}."
 
     info "Repaired forwarding and NAT using outbound interface $WG_OUT_INTERFACE."
     info "Reconnect the client, then run: sudo $PROGRAM doctor"
+}
+
+cmd_encrypted_dns() {
+    require_root
+    load_state
+    acquire_lock
+
+    case ${1:-} in
+        on)
+            (( ! WG_ENCRYPTED_DNS )) || die "Encrypted DNS is already on."
+            install_resolver_packages
+            WG_ENCRYPTED_DNS=1
+            setup_resolver
+            if interface_is_up; then
+                apply_firewall_rules add < <(dns_firewall_rules)
+            fi
+            write_hooks
+            set_client_dns "${WG_SERVER_ADDRESS%/*}"
+            info "Clients now resolve through ${WG_SERVER_ADDRESS%/*}, which forwards over DNS-over-TLS."
+            ;;
+        off)
+            (( WG_ENCRYPTED_DNS )) || die "Encrypted DNS is already off."
+            remove_resolver
+            apply_firewall_rules delete < <(dns_firewall_rules)
+            WG_ENCRYPTED_DNS=0
+            write_hooks
+            set_client_dns "$DEFAULT_DNS"
+            ;;
+        *)
+            die "Usage: sudo $PROGRAM encrypted-dns on|off"
+            ;;
+    esac
 }
 
 print_config() {
@@ -885,6 +1086,7 @@ print_config() {
     printf 'Tunnel subnet:      %s\n' "$WG_SUBNET"
     printf 'Server address:     %s\n' "$WG_SERVER_ADDRESS"
     printf 'Client DNS:         %s\n' "$WG_DNS"
+    printf 'Encrypted DNS:      %s\n' "$( (( WG_ENCRYPTED_DNS )) && printf 'on (%s)' "$(resolver_unit)" || printf off)"
     printf 'Outbound interface: %s\n' "$WG_OUT_INTERFACE"
     printf 'Service state:      %s\n' "$(interface_is_up && printf up || printf down)"
 }
@@ -903,6 +1105,7 @@ Usage:
   sudo $PROGRAM active [seconds]
   sudo $PROGRAM qr <username>
   sudo $PROGRAM dns "<server1, server2>"
+  sudo $PROGRAM encrypted-dns on|off
   sudo $PROGRAM doctor
   sudo $PROGRAM repair-network
   sudo $PROGRAM config
@@ -913,6 +1116,7 @@ Install options:
   --subnet <x.x.x.0/24> Private client subnet (default: $DEFAULT_SUBNET).
   --dns <servers>       Comma-separated client DNS values (default: $DEFAULT_DNS).
   --interface <name>    WireGuard interface (default: $DEFAULT_INTERFACE).
+  --encrypted-dns       Run a DNS-over-TLS resolver on the server and point clients at it.
 
 Examples:
   sudo $PROGRAM install --endpoint vpn.example.com
@@ -921,6 +1125,7 @@ Examples:
   sudo $PROGRAM active 300
   sudo $PROGRAM qr alice
   sudo $PROGRAM dns "9.9.9.9, 149.112.112.112"
+  sudo $PROGRAM encrypted-dns on
   sudo $PROGRAM doctor
   sudo $PROGRAM repair-network
 USAGE
@@ -942,6 +1147,7 @@ WireGuard Manager
 10) Show manager configuration
 11) Diagnose tunneling
 12) Repair forwarding/NAT
+13) Turn encrypted DNS on or off
 0) Exit
 MENU
     local choice value endpoint
@@ -980,6 +1186,10 @@ MENU
         10) print_config ;;
         11) cmd_doctor ;;
         12) cmd_repair_network ;;
+        13)
+            read -r -p "Encrypted DNS (on/off): " value
+            cmd_encrypted_dns "$value"
+            ;;
         0) exit 0 ;;
         *) die "Invalid selection." ;;
     esac
@@ -1008,6 +1218,7 @@ main() {
         active)       cmd_active "$@" ;;
         qr)           cmd_qr "$@" ;;
         dns)          cmd_dns "$@" ;;
+        encrypted-dns) cmd_encrypted_dns "$@" ;;
         doctor|diagnose) cmd_doctor "$@" ;;
         repair-network|repair) cmd_repair_network "$@" ;;
         config)       print_config "$@" ;;
@@ -1019,4 +1230,7 @@ main() {
     esac
 }
 
-main "$@"
+# Sourcing the script (as tests/run.sh does) defines the functions without running anything.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
