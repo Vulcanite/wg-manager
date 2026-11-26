@@ -10,7 +10,7 @@ With Oracle Cloud's free tier I got access to three machines: two x86 machines w
 
 That is good enough for a simple WireGuard network. A lot of people don't know that you can set up your own VPN server with free resources. You don't get a choice of region, but that depends on your account. I live in Singapore, but because my main address is in India, my Oracle account is in India. If you get a free server anywhere else, the script works the same.
 
-The purpose of the project is a simple script that installs WireGuard, adds users to your server and gives each one a QR code. Then you scan the QR code with the WireGuard app (available on both the iOS and Android app stores), and it imports the configuration into your phone straight away. You can also set your own DNS server.
+The purpose of the project is a simple script that installs WireGuard, adds users to your server and gives each one a QR code. Then you scan the QR code with the WireGuard app (available on both the iOS and Android app stores), and it imports the configuration into your phone straight away. You can also set your own DNS servers, or run an encrypted DNS resolver on the server itself.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ The purpose of the project is a simple script that installs WireGuard, adds user
 - Bash 4 or newer
 - Root (every command except `help` must be run with `sudo`)
 - A kernel with WireGuard support (mainline since 5.6)
-- One of these package managers: `apt-get`, `dnf`, `yum`, `pacman`, `zypper`. The script installs `wireguard-tools`, `qrencode`, `iproute2` and `iptables` with it (see the tested-on table for what has actually been checked)
+- One of these package managers: `apt-get`, `dnf`, `pacman`, `zypper`. The script installs `wireguard-tools`, `qrencode`, `iproute2` and `iptables` with it, plus `unbound` for encrypted DNS (see the tested-on table for what has actually been checked)
 - A public IP or hostname, and the chosen UDP port (default 51820) open in any cloud or provider firewall
 
 ## Install
@@ -34,6 +34,9 @@ Read the script before running it as root. It is one file.
 ```sh
 # Set up the server (installs packages, creates wg0, starts it)
 sudo wg-manager install --endpoint vpn.example.com
+
+# Or with an encrypted DNS resolver for clients (see "Encrypted DNS")
+sudo wg-manager install --endpoint vpn.example.com --encrypted-dns
 
 # Add a user; prints a QR code you can scan with the WireGuard mobile app
 sudo wg-manager add alice
@@ -58,7 +61,7 @@ Running `sudo wg-manager` with no arguments in a terminal opens a numbered menu 
 
 | Command | Aliases | What it does |
 |---|---|---|
-| `install --endpoint <host-or-ip> [options]` | | Install packages, create the server config and keys, enable forwarding, open the port in UFW or firewalld if one is active, start `wg-quick@<interface>`. Refuses to run if it is already installed or if `/etc/wireguard/<interface>.conf` already exists. |
+| `install --endpoint <host-or-ip> [options]` | | Install packages, create the server config and keys, enable forwarding, open the port in UFW or firewalld if one is active (and in iptables through the interface's `PostUp`), start `wg-quick@<interface>`. Refuses to run if it is already installed or if `/etc/wireguard/<interface>.conf` already exists. |
 | `add <username>` | | Create keys, a pre-shared key and the next free address for a user, add the peer to the running interface and the config, write the client config and a QR PNG, print the QR code. |
 | `delete <username>` | `del`, `remove` | Remove the peer from the config and the running interface, then delete the user's directory. |
 | `list` | `users` | Users, tunnel addresses, status (`active` if the last handshake was within 180 seconds, else `inactive` or `never`) and last handshake. |
@@ -67,7 +70,8 @@ Running `sudo wg-manager` with no arguments in a terminal opens a numbered menu 
 | `active [seconds]` | | Users with a handshake in the last N seconds (default 180). |
 | `qr <username>` | | Regenerate the QR PNG and print the QR code and file paths. |
 | `dns "<server1, server2>"` | | Change the DNS line in every client config and regenerate the QR images. Devices must re-import their profile. |
-| `doctor` | `diagnose` | Check that the interface is up, forwarding is on, the outbound interface has not changed, and the NAT and FORWARD rules exist. Exits non-zero if something is missing. |
+| `encrypted-dns on\|off` | | Start or stop the DNS-over-TLS resolver on the server and point every client profile at it (or back at `1.1.1.1, 1.0.0.1`). Devices must re-import their profile. |
+| `doctor` | `diagnose` | Check that the interface is up, forwarding is on, the outbound interface has not changed, every firewall rule exists and, with encrypted DNS, the resolver is running. Exits non-zero if something is missing. |
 | `repair-network` | `repair` | Re-detect the outbound interface, rewrite the `PostUp`/`PostDown` firewall rules, re-enable forwarding and restart the interface. |
 | `config` | | Print the saved settings and whether the interface is up. |
 | `help` | `-h`, `--help` | Print usage. |
@@ -81,6 +85,7 @@ Install options:
 | `--subnet <x.x.x.0/24>` | `10.66.66.0/24` | Must be a private (RFC 1918) /24. The server takes `.1`, clients get `.2` to `.254`. |
 | `--dns <servers>` | `1.1.1.1, 1.0.0.1` | Comma-separated DNS servers written into client configs. |
 | `--interface <name>` | `wg0` | WireGuard interface name. |
+| `--encrypted-dns` | off | Run a DNS-over-TLS resolver on the server and give clients its tunnel address as DNS. Cannot be combined with `--dns`. |
 
 Usernames are 1 to 32 characters: letters, digits, `.`, `_` and `-`, starting with a letter or digit.
 
@@ -92,6 +97,7 @@ Usernames are 1 to 32 characters: letters, digits, `.`, `_` and `-`, starting wi
 | `/etc/wireguard/wg-manager/settings.conf` | Saved install settings (interface, port, endpoint, subnet, DNS, outbound interface) |
 | `/etc/wireguard/wg-manager/server-public.key` | Server public key |
 | `/etc/wireguard/wg-manager/users/<name>/` | `private.key`, `public.key`, `preshared.key`, `ip`, `<name>.conf` (client config) and `<name>.png` (QR code) |
+| `/etc/unbound/wg-manager-<interface>.conf`, `/etc/systemd/system/wg-manager-dns-<interface>.service` | The encrypted DNS resolver, when it is on |
 | `/etc/sysctl.d/99-wireguard-forward.conf` | `net.ipv4.ip_forward = 1` |
 | `/run/wg-manager.lock` | Lock directory held while a command that changes state is running |
 
@@ -119,12 +125,32 @@ AllowedIPs = 0.0.0.0/0, ::/0
 
 or make the same edit in `/etc/wireguard/wg-manager/users/<name>/<name>.conf` on the server, run `sudo wg-manager qr <name>` to regenerate the QR code, and re-import the profile on the device. Nothing changes on the server side for existing peers.
 
+## Encrypted DNS
+
+By default clients use `1.1.1.1, 1.0.0.1`. Those queries go through the tunnel, but they leave the server as plain DNS on port 53, so the server's network can read them.
+
+With `--encrypted-dns` at install, or `sudo wg-manager encrypted-dns on` later, the script installs `unbound` and runs its own instance (`wg-manager-dns-<interface>.service`):
+
+- It listens only on the server's tunnel address (`10.66.66.1` by default) and answers only the tunnel subnet. It is not reachable from the internet.
+- It forwards every query over DNS-over-TLS (port 853) to Cloudflare (`1.1.1.1`, `1.0.0.1`) and Quad9 (`9.9.9.9`, `149.112.112.112`), checking their certificates.
+- Client profiles get `DNS = 10.66.66.1`. Existing devices keep their old DNS until they re-import the profile (`sudo wg-manager qr <name>`).
+- The interface's `PostUp` adds two INPUT rules that allow port 53 from the tunnel interface only.
+- The distribution's own `unbound.service` is disabled if the package was installed by this script. If `unbound` was already installed, it is left alone.
+
+The resolver uses about 20 MB of RAM. `encrypted-dns off` stops and removes it and sets client DNS back to the default; the `unbound` package stays installed.
+
+## Upgrading
+
+Replace the script with the new version. Settings and users are kept. From 1.2.0 the interface's `PostUp` also opens the UDP port in iptables; to get that on an existing install, run `sudo wg-manager repair-network` once (it restarts the interface, so connected clients reconnect).
+
 ## Uninstall
 
 There is no uninstall command. With the default interface name and port:
 
 ```sh
-sudo systemctl disable --now wg-quick@wg0        # stops the tunnel; PostDown removes the FORWARD and NAT rules
+sudo systemctl disable --now wg-quick@wg0        # stops the tunnel; PostDown removes the firewall rules
+sudo systemctl disable --now wg-manager-dns-wg0  # only if encrypted DNS is on
+sudo rm -f /etc/systemd/system/wg-manager-dns-wg0.service /etc/unbound/wg-manager-wg0.conf
 sudo rm -f /etc/wireguard/wg0.conf
 sudo rm -rf /etc/wireguard/wg-manager            # deletes all user keys and client configs
 sudo rm -f /etc/sysctl.d/99-wireguard-forward.conf
@@ -146,8 +172,8 @@ The same steps clean up after an install that failed halfway, since `install` re
 - Each user gets their own pre-shared key in addition to the key pair.
 - Client configs route `0.0.0.0/0, ::/0` through the tunnel. The server is IPv4-only, so IPv6 traffic from a connected client goes into the tunnel and is dropped there instead of leaving over the local network. See [IPv6](#ipv6).
 - Firewall changes made by the script:
-  - `install` opens the UDP port with `ufw allow` or `firewall-cmd --permanent --add-port` if UFW or firewalld is active. Otherwise it changes nothing for incoming traffic and prints a reminder; if your host's INPUT chain rejects unknown traffic (some cloud images do), allow the UDP port yourself.
-  - `PostUp` inserts two FORWARD rules at the top of the chain (tunnel to internet, and established return traffic) and appends a MASQUERADE rule for the tunnel subnet. `PostDown` removes them.
+  - `install` opens the UDP port with `ufw allow` or `firewall-cmd --permanent --add-port` if UFW or firewalld is active. The cloud provider's firewall (for example an Oracle Cloud security list) still has to allow it; the script cannot change that.
+  - `PostUp` inserts an INPUT rule for the UDP port and two FORWARD rules at the top of their chains (tunnel to internet, and established return traffic), and appends a MASQUERADE rule for the tunnel subnet. With encrypted DNS it also allows port 53 from the tunnel interface. `PostDown` removes them. The INPUT rule is what lets clients in on images whose INPUT chain ends in REJECT, such as Oracle Cloud's Ubuntu.
   - `net.ipv4.ip_forward` is set to 1 and persisted in `/etc/sysctl.d`.
 - Usernames are checked against a strict pattern before they are used in any path or config, so they cannot inject shell or config syntax.
 - Clients can reach other hosts the server can reach, including the server's LAN or VPC. Add your own FORWARD rules if they should not.
@@ -158,12 +184,11 @@ This table separates what has been run from what has only been read.
 
 | Environment | What was checked | Result |
 |---|---|---|
-| Ubuntu 24.04, Oracle Cloud VM, kernel 6.17 | Version 1.1.0 (before the fixes in this repo's history) has been in use there with a live `wg0`. | Works in day-to-day use. The current version has not been run there. |
-| Ubuntu 26.04 (WSL2), Bash 5.3, unprivileged sandbox with no network | Every command run end to end as fake root, with `wg`, `systemctl`, `iptables`, `qrencode`, `ip` and the package managers replaced by stubs. Checked file layout and permissions, peer add/delete in the config, input validation, locking, error paths. | Pass. This does not touch a real WireGuard interface, real firewall rules or real packages. |
-| `bash -n` | Syntax | Pass |
-| ShellCheck | Runs in CI on every push (`.github/workflows/lint.yml`) | Not run locally yet |
+| Ubuntu 24.04, Oracle Cloud VM, kernel 6.17 | 1.1.1 runs the live `wg0`. 1.2.0 was installed there as a second instance (`wg9`, its own port and subnet) with `--encrypted-dns`, with a client in a network namespace on the same host connected through a veth pair. Checked: handshake, internet through NAT, DNS over UDP and TCP through the resolver, upstream traffic only on port 853, resolver not reachable from outside, `add` (including rollback after a failure), `delete`, `list`, `traffic`, `encrypted-dns off`/`on` with the interface up, `repair-network`, `doctor`, resolver surviving an interface restart, and a fresh `unbound` install leaving the distribution's `unbound.service` disabled. Removed afterwards; iptables matched the state before the test. | Pass. The client did not come in over the internet (the cloud security list only allows the live port), so the cloud firewall path was not part of this test. |
+| `tests/run.sh` | Validators, endpoint parsing, peer block removal, firewall rule and hook generation. Runs in CI. | Pass |
+| `bash -n`, ShellCheck | Run in CI on every push (`.github/workflows/lint.yml`) | Pass |
 | Debian | apt path, same as Ubuntu | Untested |
-| Fedora / RHEL / Rocky / Alma | dnf path (`yum` fallback for old releases) | Untested. On RHEL-family systems `qrencode` may need EPEL, which the dnf path does not enable. With firewalld active, its own forward rules may block client traffic even though the iptables rules are present. |
+| Fedora / RHEL / Rocky / Alma | dnf path | Untested. On RHEL-family systems `qrencode` may need EPEL, which the dnf path does not enable. With firewalld active, its own forward rules may block client traffic even though the iptables rules are present. |
 | Arch | pacman path | Untested. Uses `pacman -S --needed` without refreshing the package databases; if they are stale, run `pacman -Syu` first. The `iptables` package may conflict with an installed `iptables-nft`. |
 | openSUSE | zypper path | Untested. Same firewalld caveat as Fedora. |
 
@@ -173,10 +198,21 @@ If you run it on one of the untested systems, an issue with the result (working 
 
 - IPv4 only on the server. Clients get no IPv6 while connected (see [IPv6](#ipv6)).
 - With firewalld active on Fedora, RHEL-family or openSUSE, `install` opens the UDP port, but firewalld's own forwarding policy may still block client traffic to the internet even though the script's iptables rules are in place. This has not been tested.
-- The `yum` path (EL7 and similar) is effectively unsupported: those releases are end of life, their kernels lack built-in WireGuard, and the path has never been run.
+- `yum`-only systems (EL7 and similar) are not supported: those releases are end of life and their kernels lack built-in WireGuard.
+- The encrypted DNS resolver has only been run on Ubuntu. On other distributions the `unbound` user and AppArmor/SELinux policy may differ.
 - No uninstall command. See [Uninstall](#uninstall) for the manual steps.
 
 ## Changes
+
+### 1.2.0
+
+- Encrypted DNS: `install --encrypted-dns` and `encrypted-dns on|off` run a DNS-over-TLS resolver on the tunnel address (see [Encrypted DNS](#encrypted-dns)).
+- The interface's `PostUp` opens the UDP port in iptables. Before, on hosts whose INPUT chain ends in REJECT (Oracle Cloud's Ubuntu images), a fresh install never received a handshake until the port was opened by hand.
+- A failed `add` is rolled back: no user folder, peer block or runtime peer is left behind, so the same name can be added again.
+- The firewall rules are defined once and used by `install`, `repair-network`, `encrypted-dns` and `doctor`. `doctor` now lists each rule it checks.
+- `dns` adds a DNS line to a profile that has none instead of skipping it while counting it as updated.
+- The `yum` fallback was removed.
+- Added `tests/run.sh`, run in CI.
 
 ### 1.1.1
 
